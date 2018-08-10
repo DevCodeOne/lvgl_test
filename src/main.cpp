@@ -1,65 +1,46 @@
-// clang-format off
 #include <unistd.h>
-#include <limits.h>
 #include <fcntl.h>
-#include <stropts.h>
-#include <errno.h>
-#include <stdio.h>
 #include <linux/fb.h>
 #include <sys/mman.h>
-// clang-format on
+#include <sys/ioctl.h>
 
 #include <algorithm>
+#include <iostream>
 #include <chrono>
 #include <thread>
-#include <cstring>
 
-#include "SDL/SDL.h"
 #include "lvgl.h"
 
-static fb_var_screeninfo vinfo;
-static fb_var_screeninfo original_vinfo;
-static fb_fix_screeninfo finfo;
-static unsigned char *framebuffer_memory;
-static int framebuffer_descriptor;
-static uint64_t framebuffer_size;
+static struct fb_var_screeninfo vinfo;
+static struct fb_fix_screeninfo finfo;
+static uint64_t framebuffer_memory_length = 0;
+static int framebuffer_descriptor = 0;
+static char *framebuffer_memory = nullptr;
 
 void fbdev_init() {
-    framebuffer_descriptor = open("/dev/fb0", O_RDWR);
+	framebuffer_descriptor = open("/dev/fb0", O_RDWR);
+	if (framebuffer_descriptor == -1) {
+		perror("Error: cannot open framebuffer device");
+		return;
+	}
 
-    if (!framebuffer_descriptor) {
-        return;
-    }
+	if (ioctl(framebuffer_descriptor, FBIOGET_FSCREENINFO, &finfo) == -1) {
+		perror("Error reading fixed information");
+		return;
+	}
 
-    if (ioctl(framebuffer_descriptor, FBIOGET_VSCREENINFO, &vinfo) < 0) {
-        perror("Error getting information about the framebuffer");
-    }
+	if (ioctl(framebuffer_descriptor, FBIOGET_VSCREENINFO, &vinfo) == -1) {
+		perror("Error reading variable information");
+		return;
+	}
 
-    memcpy(&original_vinfo, &vinfo, sizeof(fb_var_screeninfo));
+	framebuffer_memory_length = vinfo.xres * vinfo.yres * vinfo.bits_per_pixel / 8;
 
-    if (ioctl(framebuffer_descriptor, FBIOGET_VSCREENINFO, &finfo) < 0) {
-        perror("Error getting information about the framebuffer");
-    }
-
-    vinfo.bits_per_pixel = 24;
-    vinfo.xres = 320;
-    vinfo.yres = 480;
-    vinfo.xres_virtual = vinfo.xres;
-    vinfo.yres_virtual = vinfo.yres;
-
-    if (ioctl(framebuffer_descriptor, FBIOPUT_VSCREENINFO, &vinfo) < 0) {
-        perror("Error setting new framebuffer dimensions");
-    }
-
-    framebuffer_size = vinfo.xres * vinfo.yres * (vinfo.bits_per_pixel / 8);
-
-    framebuffer_memory =
-        (unsigned char *)mmap(0, framebuffer_size, PROT_READ | PROT_WRITE,
-                              MAP_SHARED, framebuffer_descriptor, 0);
-
-    if ((int64_t)framebuffer_memory < 0) {
-        perror("Error mmapping framebuffer memory");
-    }
+	framebuffer_memory = (char *)mmap(nullptr, framebuffer_memory_length, PROT_READ | PROT_WRITE, MAP_SHARED, framebuffer_descriptor, 0);
+	if ((int)framebuffer_memory == -1) {
+		perror("Error: failed to map framebuffer device to memory");
+		return;
+	}
 }
 
 template <typename Type>
@@ -70,49 +51,48 @@ void do_copy(int32_t x1, int32_t y1, int32_t x2, int32_t y2,
     int act_x2 = std::clamp<int>(x2, 0, vinfo.xres - 1);
     int act_y2 = std::clamp<int>(y2, 0, vinfo.yres - 1);
 
-    Type *color_pointer = (Type *)color_p;
-    Type *framebuffer_memory_type = (Type *)framebuffer_memory;
+    const lv_color_t *color_pointer = color_p;
+    Type *pixels = (Type *) framebuffer_memory;
 
-    int32_t x_off = (act_x1 + vinfo.xoffset);
-    int32_t x_off_color = (act_x1 - x1);
-    int32_t cpy_length = act_x2 - act_x1;
+    for (int32_t y_it = act_y1; y_it <= act_y2; ++y_it) {
+	long off_y = (y_it + vinfo.yoffset) * vinfo.xres;
+	for (int32_t x_it = act_x1; x_it <= act_x2; ++x_it) {
+		pixels[(x_it + vinfo.xoffset) + off_y] = color_pointer->full;
+		++color_pointer;
+	}
 
-    for (int32_t y_it = act_y1; y_it < act_y2; ++y_it) {
-        int32_t y_off = (y_it + vinfo.yoffset) * vinfo.xres;
-        int32_t y_off_color = (y_it - y1) * (x2 - x1);
-
-        std::memcpy(framebuffer_memory_type + y_off + x_off,
-                    color_pointer + y_off_color + x_off_color, cpy_length);
-    }
-}
-
-void fbdev_map(int32_t x1, int32_t y1, int32_t x2, int32_t y2,
-               const lv_color_t *color) {
-    if (!framebuffer_memory || x2 < 0 || y2 < 0 ||
-        x1 > (int32_t)vinfo.xres - 1 || y2 > (int32_t)vinfo.yres - 1) {
-        return;
-    }
-
-    switch (vinfo.bits_per_pixel) {
-        case 32:
-        case 24:
-            do_copy<int32_t>(x1, y1, x2, y2, color);
-            break;
-        case 16:
-            do_copy<int16_t>(x1, y1, x2, y2, color);
-            break;
-        case 8:
-            do_copy<int8_t>(x1, y1, x2, y2, color);
-            break;
-        default:
-            break;
+	color_pointer += (x2 - act_x2);
     }
 }
 
 void fbdev_flush(int32_t x1, int32_t y1, int32_t x2, int32_t y2,
-                 const lv_color_t *color) {
-    fbdev_map(x1, y1, x2, y2, color);
-    lv_flush_ready();
+		const lv_color_t *color_p) {
+	if(framebuffer_memory == nullptr ||
+			x2 < 0 ||
+			y2 < 0 ||
+			x1 > vinfo.xres - 1 ||
+			y1 > vinfo.yres - 1)
+	{
+		lv_flush_ready();
+		return;
+	}
+
+	switch (vinfo.bits_per_pixel) {
+		case 32:
+		case 24:
+			do_copy<uint32_t>(x1, y1, x2, y2, color_p);
+			break;
+		case 16:
+			do_copy<uint16_t>(x1, y1, x2, y2, color_p);
+			break;
+		case 8:
+			do_copy<uint8_t>(x1, y1, x2, y2, color_p);
+			break;
+		default:
+			break;
+	}
+
+	lv_flush_ready();
 }
 
 int main() {
@@ -127,16 +107,14 @@ int main() {
 
     lv_disp_drv_register(&display_driver);
 
-    lv_obj_t *label = lv_label_create(lv_scr_act(), nullptr);
-    lv_label_set_text(label, "Hello World!");
+    lv_obj_t *label = lv_btn_create(lv_scr_act(), nullptr);
+    // lv_label_set_text(label, "Hello World!");
     lv_obj_align(label, nullptr, LV_ALIGN_CENTER, 0, 0);
 
     while (1) {
         lv_task_handler();
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	std::cout << "Loop" << std::endl;
     }
-
-    munmap(framebuffer_memory, framebuffer_size);
-    close(framebuffer_descriptor);
     return 0;
 }
