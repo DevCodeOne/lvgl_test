@@ -10,7 +10,6 @@ add_executable(lvgl_test src/main.cpp)
 set_property(TARGET lvgl_test PROPERTY CXX_STANDARD 17)
 
 target_include_directories(lvgl PRIVATE include)
-target_link_libraries(lvgl_test PRIVATE lvgl)
-
-target_include_directories(lvgl_test PUBLIC -lts)
+target_link_libraries(lvgl_test PUBLIC lvgl)
+target_link_libraries(lvgl_test PUBLIC ts)
 
